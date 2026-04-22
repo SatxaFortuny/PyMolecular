@@ -1,148 +1,67 @@
 import triton
 import triton.language as tl
 
-# =========================================================================== #
-#  MESSAGE PASSING FORWARD KERNEL                                             #
-# =========================================================================== #
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_ATOMS": 32,  "BLOCK_OUTPUT": 64},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_ATOMS": 32,  "BLOCK_OUTPUT": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_ATOMS": 64,  "BLOCK_OUTPUT": 64},  num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_ATOMS": 64,  "BLOCK_OUTPUT": 128}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_ATOMS": 64,  "BLOCK_OUTPUT": 256}, num_warps=8, num_stages=3),
-    ],
-    key=["num_molecules", "actual_A", "actual_X", "actual_O"],
-)
 @triton.jit
-def fused_message_mpnn_forward(
-    # Pointers to the tensors
-    X_pointer, A_pointer, W_pointer, O_pointer,
-           
-    # Widths
-    molecule_width, atom_width, feature_width,
-    mol_adj_width, adj_row_width, adj_col_width,
-    w_row_width, w_col_width,
-    o_mol_width, o_row_width, o_col_width,
+def mpnn_forward(
+    node_feat_ptr, stride_nf_n,    # node features
+    coord_ptr, stride_coord_n,     # x y z coordinates
+    row_ptr,                       # index array
+    col_ptr,                       # destiny node
+    edge_ptr, stride_edge_n,       # edge features
     
-    # Actual limits, necessary in order to not process garbage
-    num_molecules,
-    actual_A, actual_X, actual_O,
+    # Weights
+    w_msg_ptr,                       # Message MLP weights
+    w_mov_ptr,                       # Movement MLP weights
+    w_nod_ptr,                       # Node MLP weights
     
+    # RBF
+    rbf_centers_ptr,
+    rbf_gamma,
     
-    BLOCK_ATOMS: tl.constexpr,
-    BLOCK_FEATURES: tl.constexpr,
-    BLOCK_OUTPUT: tl.constexpr,
+    # Output
+    out_feat_ptr, stride_ofeat_n,
+    out_coord_ptr, stride_ocoord_n,
+    
+    num_nodes,
+    
+    BLOCK_N: tl.constexpr,         # number of nodes x process
+    BLOCK_NEIGHBORS: tl.constexpr, # max neighbors x node
+    F_NODE: tl.constexpr,          # num features x node
+    F_EDGE: tl.constexpr,          # num features x edge
+    RBF_DIM: tl.constexpr,         # number of gauss bells  
 ):
 
-    # SETUP: identification, memory preparation, masks.
+    # 1. Identification
+    process_index = tl.program_id(axis=0)
+    node_index = process_index * BLOCK_N * tl.arange(0, BLOCK_N)
     
-    molecule_index = tl.program_id(axis=0)
-    feature_index = tl.program_id(axis=1)
-    if (molecule_index >= num_molecules):
-        return
-        
+    # 2. Features and coordinates load
+    x_nod_base_addr = node_feat_ptr + process_index * BLOCK_N * stride_nf_n
+    c_nod_base_addr = coord_ptr + process_index * BLOCK_N * stride_nf_n
     
-    # mem = base + id * width    
-    X_base = X_pointer + molecule_index * molecule_width
-    A_base = A_pointer + molecule_index * mol_adj_width
-    W_base = W_pointer
-    O_base = O_pointer + molecule_index * o_mol_width
-
-    rows_sequence = tl.arange(0, BLOCK_ATOMS)
-    cols_sequence = tl.arange(0, BLOCK_FEATURES)
-    features_sequence = tl.arange(0, BLOCK_OUTPUT) + (BLOCK_OUTPUT * feature_index)
-    X_pointers = X_base + (rows_sequence[:, None] * atom_width) + (cols_sequence[None, :] * feature_width)
-    A_pointers = A_base + (rows_sequence[:, None] * adj_row_width) + (rows_sequence[None, :] * adj_col_width)
-    W_pointers = W_base + (cols_sequence[:, None] * w_row_width) + (features_sequence[None, :] * w_col_width)
-    O_pointers = O_base + (rows_sequence[:, None] * o_row_width) + (features_sequence[None, :] * o_col_width)
+    vertical_sequence = tl.arange(0, BLOCK_N)
+    horizontal_x_sequence = tl.arange(0, F_NODE)
+    horizontal_c_sequence = tl.arange(0, 3)
     
-    X_mask = (rows_sequence[:, None] < actual_A) & (cols_sequence[None, :] < actual_X)
-    A_mask = (rows_sequence[:, None] < actual_A) & (rows_sequence[None, :] < actual_A)
-    W_mask = (cols_sequence[:, None] < actual_X) & (features_sequence[None, :] < actual_O)
-    O_mask = (rows_sequence[:, None] < actual_A) & (features_sequence[None, :] < actual_O)
+    x_nod_addr = x_nod_base_addr + (vertical_sequence[:, None] * stride_nf_n) + (horizontal_x_sequence[None, :])
+    c_nod_addr = c_nod_base_addr + (vertical_sequence[:, None] * stride_coord_n) + (horizontal_c_sequence[None, :])
     
-    X = tl.load(X_pointers, mask=X_mask, other=0.0)
-    A = tl.load(A_pointers, mask=A_mask, other=0.0)
-    W = tl.load(W_pointers, mask=W_mask, other=0.0)
+    x_nod_mask = (node_index[:, None] < num_nodes) & (horizontal_x_sequence[None, :] < F_NODE)
+    c_nod_mask = (node_index[:, None] < num_nodes) & (horizontal_c_sequence[None, :] < 3)
     
-    # Weight multiplication, message passing, activation function
+    X_node = tl.load(x_nod_addr, mask=x_nod_mask, other=0.0)
+    C_node = tl.load(c_nod_addr, mask=c_nod_mask, other=0.0)
+    # 3. Neighbors fetch
     
-    temp = tl.dot(X, W)
-    msgs = tl.dot(A, temp)
-    O = tl.maximum(0.0, msgs)
+    # 4. Neighbors features load
     
-    # SRAM -> VRAM
+    # 5. Distance calculator
     
-    tl.store(O_pointers, O, mask=O_mask)
+    # 6. Message obtention
     
+    # 7. Movement obtention
     
-# =========================================================================== #
-#  FORWARD KERNEL                                                             #
-# =========================================================================== #
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_ATOMS": 32,  "BLOCK_OUTPUT": 64},  num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_ATOMS": 32,  "BLOCK_OUTPUT": 128}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_ATOMS": 64,  "BLOCK_OUTPUT": 64},  num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_ATOMS": 64,  "BLOCK_OUTPUT": 128}, num_warps=8, num_stages=2),
-        triton.Config({"BLOCK_ATOMS": 64,  "BLOCK_OUTPUT": 256}, num_warps=8, num_stages=3),
-    ],
-    key=["num_molecules", "actual_A", "actual_X", "actual_O"],
-)
-@triton.jit
-def fused_mpnn_forward(
-    # Pointers to the tensors
-    X_pointer, W_pointer, O_pointer,
-           
-    # Widths
-    molecule_width, atom_width, feature_width,
-    w_row_width, w_col_width,
-    o_mol_width, o_row_width, o_col_width,
+    # 8. Final message calculation
     
-    # Actual limits, necessary in order to not process garbage
-    num_molecules,
-    actual_A, actual_X, actual_O,
-    
-    
-    BLOCK_ATOMS: tl.constexpr,
-    BLOCK_FEATURES: tl.constexpr,
-    BLOCK_OUTPUT: tl.constexpr,
-):
-
-    # SETUP: identification, memory preparation, masks.
-    
-    molecule_index = tl.program_id(axis=0)
-    feature_index = tl.program_id(axis=1)
-    if (molecule_index >= num_molecules):
-        return
-        
-    
-    # mem = base + id * width    
-    X_base = X_pointer + molecule_index * molecule_width
-    W_base = W_pointer
-    O_base = O_pointer + molecule_index * o_mol_width
-
-    rows_sequence = tl.arange(0, BLOCK_ATOMS)
-    cols_sequence = tl.arange(0, BLOCK_FEATURES)
-    features_sequence = tl.arange(0, BLOCK_OUTPUT) + (BLOCK_OUTPUT * feature_index)
-    X_pointers = X_base + (rows_sequence[:, None] * atom_width) + (cols_sequence[None, :] * feature_width)
-    W_pointers = W_base + (cols_sequence[:, None] * w_row_width) + (features_sequence[None, :] * w_col_width)
-    O_pointers = O_base + (rows_sequence[:, None] * o_row_width) + (features_sequence[None, :] * o_col_width)
-    
-    X_mask = (rows_sequence[:, None] < actual_A) & (cols_sequence[None, :] < actual_X)
-    W_mask = (cols_sequence[:, None] < actual_X) & (features_sequence[None, :] < actual_O)
-    O_mask = (rows_sequence[:, None] < actual_A) & (features_sequence[None, :] < actual_O)
-    
-    X = tl.load(X_pointers, mask=X_mask, other=0.0)
-    W = tl.load(W_pointers, mask=W_mask, other=0.0)
-    
-    # Weight multiplication, activation function
-    
-    temp = tl.dot(X, W)
-    O = tl.maximum(0.0, temp)
-    
-    # SRAM -> VRAM
-    
-    tl.store(O_pointers, O, mask=O_mask)
+    # 9. New features obtention and storing
     
