@@ -87,6 +87,8 @@ def mpnn_forward(
     distances = tl.exp(-rbf_gamma * (centered_x * centered_x))
 
     # 6. Message obtention
+    horizontal_e_sequence = tl.arange(0, F_EDGE)
+    e_features_addr = edge_ptr + ()
     
     # 7. Movement obtention
     
