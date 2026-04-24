@@ -7,19 +7,23 @@ def mpnn_forward(
     coord_ptr, stride_coord_n,     # x y z coordinates
     src_idx_ptr,                   # source array
     dst_idx_ptr,                   # destiny array
-    edge_feat_ptr, stride_edge_n,       # edge features
+    edge_feat_ptr, stride_edge_n,  # edge features
     
     # Weights
-    w_msg_ptr,                       # Message MLP weights
-    w_mov_ptr,                       # Movement MLP weights
+    w1_msg_ptr,                     # Message MLP weights layer 1
+    w2_msg_ptr,                     # Message MLP weights layer 2
+    w1_mov_ptr,                     # Movement MLP weights
+    w2_mov_ptr,
     
     # RBF
-    rbf_centers_ptr,
-    rbf_gamma,
+    rbf_centers_ptr,                # position of the gaussian bells
+    rbf_gamma,                      # width of the gaussian bells
     
     # Output
-    out_feat_ptr, stride_ofeat_n,
-    out_coord_ptr, stride_ocoord_n,
+    out_msg1_ptr,                   # partial message for node 1
+    out_msg2_ptr,                   # partial message for node 2
+    out_mov1_ptr,                   # movement for node 1
+    out_mov2_ptr,                   # movement for node 2
     
     num_edges,
     
@@ -27,8 +31,10 @@ def mpnn_forward(
     F_NODE: tl.constexpr,          # num features x node
     F_EDGE: tl.constexpr,          # num features x edge
     RBF_DIM: tl.constexpr,         # number of gauss bells  
-    HIDDEN_FEATURES: tl.constexpr,
-    OUT_FEATURES: tl.constexpr
+    HIDDEN_FEATURES: tl.constexpr, # n features mlp message hidden layer
+    OUT_FEATURES: tl.constexpr,    # n features mlp message output layer
+    HID_FEAT_MOV_MLP: tl.constexpr,# n features mlp movement hidden layer
+    BETA: tl.constexpr             # beta value for RBF. Should be 1 for training compatibility
 ):
 
     # 1. Identification
@@ -70,20 +76,106 @@ def mpnn_forward(
     centers = tl.load(rbf_centers_ptr + rbf_seq)
 
     x_inc = n1_coord - n2_coord
-    x_inc = x_inc*x_inc
-    x = tl.sum(x_inc, axis=1)
+    x = x_inc * x_inc
+    x = tl.sum(x, axis=1)
     x = tl.sqrt(x)
     centered_x = x[:, None] - centers[None, :]
     distances = tl.exp(-rbf_gamma * (centered_x * centered_x))
     
     # 5. MLP partial message obtention
-    w_m_sequence = tl.arange(0, OUT_FEATURES)
-    n2_sequence = F_NODE + n_feat_sequence
-    
-    w_m_node_feat_addr = w_msg_ptr + (n_feat_sequence[:, None] * HIDDEN_FEATURES) + w_m_sequence[None, :]
-    W_node_message = tl.load(w_m_node_feat_addr, other=0.0)
+    Y1, Y2 = message_mlp(F_NODE, F_EDGE, OUT_FEATURES, HIDDEN_FEATURES, RBF_DIM, 
+                n1_feat, n2_feat, distances, e_feat, w1_msg_ptr, w2_msg_ptr, BETA)
     
     # 6. MLP edges movement obtention
+    mov1, mov2 = movement_mlp(Y1, Y2, w1_mov_ptr, w2_mov_ptr, OUT_FEATURES, HID_FEAT_MOV_MLP, BETA)
+    new_pos1 = x_inc * mov1
+    new_pos2 = -x_inc * mov2
     
     # 7. Messages and distances saving
+    horizontal_sequence = tl.arange(0, OUT_FEATURES)
+    out_msg1_addr = out_msg1_ptr + (node1[:, None] * OUT_FEATURES) + horizontal_sequence[None, :]
+    out_msg2_addr = out_msg2_ptr + (node2[:, None] * OUT_FEATURES) + horizontal_sequence[None, :]
+    out_mov1_addr = out_mov1_ptr + (node1[:, None] * stride_coord_n) + coord_sequence[None, :]
+    out_mov2_addr = out_mov2_ptr + (node2[:, None] * stride_coord_n) + coord_sequence[None, :]
     
+    mov_mask = edges_mask[:, None] & (coord_sequence[None, :] < 3)
+    
+    tl.atomic_add(out_msg1_addr, Y1, mask=edges_mask[:, None])
+    tl.atomic_add(out_msg2_addr, Y2, mask=edges_mask[:, None])
+    tl.atomic_add(out_mov1_addr, new_pos1, mask=mov_mask)
+    tl.atomic_add(out_mov2_addr, new_pos2, mask=mov_mask)
+    
+@triton.jit
+def message_mlp(
+    FEAT_N: tl.constexpr, FEAT_E: tl.constexpr, 
+    OUT_FEAT: tl.constexpr, HIDDEN_FEAT: tl.constexpr, 
+    RBF_DIM: tl.constexpr, 
+    n1, n2, distance, edge_feat, 
+    w1_msg_ptr, w2_msg_ptr,
+    BETA: tl.constexpr
+    ):
+    vertical_n_sequence = tl.arange(0, FEAT_N)
+    vertical_e_sequence = tl.arange(0, FEAT_E)
+    vertical_d_sequence = tl.arange(0, RBF_DIM)
+    horizontal_sequence = tl.arange(0, HIDDEN_FEAT)
+    
+    node_size = FEAT_N * HIDDEN_FEAT
+    distance_size = RBF_DIM * HIDDEN_FEAT
+    node2_offset = w1_msg_ptr + node_size
+    distance_offset = node2_offset + node_size
+    edge_offset = distance_offset + distance_size
+    
+    n1_w_addr = w1_msg_ptr + (vertical_n_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
+    n2_w_addr = node2_offset + (vertical_n_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
+    d_w_addr = distance_offset + (vertical_d_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
+    edge_w_addr = edge_offset + (vertical_e_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
+    
+    W_n1 = tl.load(n1_w_addr, other=0.0)
+    W_n2 = tl.load(n2_w_addr, other=0.0)
+    W_d = tl.load(d_w_addr, other=0.0)
+    W_e = tl.load(edge_w_addr, other=0.0)
+    
+    Y = tl.dot(distance, W_d) + tl.dot(edge_feat, W_e)
+    Y1 = tl.dot(n1, W_n1) + tl.dot(n2, W_n2) + Y
+    Y2 = tl.dot(n2, W_n1) + tl.dot(n1, W_n2) + Y
+    
+    X1 = swish(Y1, BETA) 
+    X2 = swish(Y2, BETA)
+    
+    horizontal_h_sequence = tl.arange(0, OUT_FEAT)
+    hl_w_addr = w2_msg_ptr + (horizontal_sequence[:, None] * OUT_FEAT) + horizontal_h_sequence[None, :]
+    
+    W_hl = tl.load(hl_w_addr, other=0.0)
+    Y1 = tl.dot(X1, W_hl)
+    Y2 = tl.dot(X2, W_hl)
+    
+    return swish(Y1, BETA), swish(Y2, BETA)
+    
+@triton.jit
+def movement_mlp(
+    x1, x2,
+    w1_mov_ptr, w2_mov_ptr,
+    IN_FEAT: tl.constexpr,
+    HIDDEN_FEAT: tl.constexpr,
+    BETA: tl.constexpr
+):
+    vertical_sequence = tl.arange(0, IN_FEAT)
+    horizontal_sequence = tl.arange(0, HIDDEN_FEAT)
+    
+    w1_addr = w1_mov_ptr + (vertical_sequence[:, None] * HIDDEN_FEAT) + horizontal_sequence[None, :]
+    
+    W1_edge = tl.load(w1_addr, other=0.0)
+    
+    Y1 = swish(tl.dot(x1, W1_edge), BETA)
+    Y2 = swish(tl.dot(x2, W1_edge), BETA)
+    
+    seq_1 = tl.arange(0, 1)
+    w2_addr = w2_mov_ptr + (horizontal_sequence[:, None] * 1) + seq_1[None, :]
+    
+    W2_edge = tl.load(w2_addr, other=0.0)
+    
+    return tl.dot(Y1, W2_edge), tl.dot(Y2, W2_edge)
+    
+@triton.jit
+def swish(Y, BETA: tl.constexpr):
+    return Y/(1 + tl.exp(-BETA * Y))
