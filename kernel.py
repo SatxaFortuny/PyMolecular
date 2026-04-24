@@ -1,6 +1,16 @@
 import triton
 import triton.language as tl
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_E': 32}, num_warps=2),
+        triton.Config({'BLOCK_E': 64}, num_warps=4),
+        triton.Config({'BLOCK_E': 128}, num_warps=4),
+        triton.Config({'BLOCK_E': 128}, num_warps=8),
+        triton.Config({'BLOCK_E': 256}, num_warps=8),
+    ],
+    key=['num_edges'],
+)
 @triton.jit
 def mpnn_forward(
     node_feat_ptr, stride_nf_n,    # node features
@@ -34,7 +44,10 @@ def mpnn_forward(
     HIDDEN_FEATURES: tl.constexpr, # n features mlp message hidden layer
     OUT_FEATURES: tl.constexpr,    # n features mlp message output layer
     HID_FEAT_MOV_MLP: tl.constexpr,# n features mlp movement hidden layer
-    BETA: tl.constexpr             # beta value for RBF. Should be 1 for training compatibility
+    MSG_BETA: tl.constexpr,        # beta value for RBF. Should be 1 for training compatibility
+    MOV_BETA: tl.constexpr,
+    MOV_ACT_TYPE: tl.constexpr,    # movement tunnable swish function
+    MSG_ACT_TYPE: tl.constexpr     # message tunnable swish function
 ):
 
     # 1. Identification
@@ -84,10 +97,10 @@ def mpnn_forward(
     
     # 5. MLP partial message obtention
     Y1, Y2 = message_mlp(F_NODE, F_EDGE, OUT_FEATURES, HIDDEN_FEATURES, RBF_DIM, 
-                n1_feat, n2_feat, distances, e_feat, w1_msg_ptr, w2_msg_ptr, BETA)
+                n1_feat, n2_feat, distances, e_feat, w1_msg_ptr, w2_msg_ptr, MSG_BETA, MSG_ACT_TYPE)
     
     # 6. MLP edges movement obtention
-    mov1, mov2 = movement_mlp(Y1, Y2, w1_mov_ptr, w2_mov_ptr, OUT_FEATURES, HID_FEAT_MOV_MLP, BETA)
+    mov1, mov2 = movement_mlp(Y1, Y2, w1_mov_ptr, w2_mov_ptr, OUT_FEATURES, HID_FEAT_MOV_MLP, MOV_BETA, MOV_ACT_TYPE)
     new_pos1 = x_inc * mov1
     new_pos2 = -x_inc * mov2
     
@@ -112,7 +125,8 @@ def message_mlp(
     RBF_DIM: tl.constexpr, 
     n1, n2, distance, edge_feat, 
     w1_msg_ptr, w2_msg_ptr,
-    BETA: tl.constexpr
+    MSG_BETA: tl.constexpr,
+    MSG_ACT_TYPE: tl.constexpr
     ):
     vertical_n_sequence = tl.arange(0, FEAT_N)
     vertical_e_sequence = tl.arange(0, FEAT_E)
@@ -139,8 +153,12 @@ def message_mlp(
     Y1 = tl.dot(n1, W_n1) + tl.dot(n2, W_n2) + Y
     Y2 = tl.dot(n2, W_n1) + tl.dot(n1, W_n2) + Y
     
-    X1 = swish(Y1, BETA) 
-    X2 = swish(Y2, BETA)
+    if MSG_ACT_TYPE == 0:
+        X1 = swish(Y1, MSG_BETA) 
+        X2 = swish(Y2, MSG_BETA)
+    else:
+        X1 = Y1 * tl.sigmoid(Y1)
+        X2 = Y2 * tl.sigmoid(Y2)
     
     horizontal_h_sequence = tl.arange(0, OUT_FEAT)
     hl_w_addr = w2_msg_ptr + (horizontal_sequence[:, None] * OUT_FEAT) + horizontal_h_sequence[None, :]
@@ -149,7 +167,13 @@ def message_mlp(
     Y1 = tl.dot(X1, W_hl)
     Y2 = tl.dot(X2, W_hl)
     
-    return swish(Y1, BETA), swish(Y2, BETA)
+    if MSG_ACT_TYPE == 0:
+        X1 = swish(Y1, MSG_BETA) 
+        X2 = swish(Y2, MSG_BETA)
+    else:
+        X1 = Y1 * tl.sigmoid(Y1)
+        X2 = Y2 * tl.sigmoid(Y2)
+    return X1, X2
     
 @triton.jit
 def movement_mlp(
@@ -157,7 +181,8 @@ def movement_mlp(
     w1_mov_ptr, w2_mov_ptr,
     IN_FEAT: tl.constexpr,
     HIDDEN_FEAT: tl.constexpr,
-    BETA: tl.constexpr
+    MOV_BETA: tl.constexpr,
+    MOV_ACT_TYPE: tl.constexpr
 ):
     vertical_sequence = tl.arange(0, IN_FEAT)
     horizontal_sequence = tl.arange(0, HIDDEN_FEAT)
@@ -166,16 +191,23 @@ def movement_mlp(
     
     W1_edge = tl.load(w1_addr, other=0.0)
     
-    Y1 = swish(tl.dot(x1, W1_edge), BETA)
-    Y2 = swish(tl.dot(x2, W1_edge), BETA)
+    Y1 = tl.dot(x1, W1_edge)
+    Y2 = tl.dot(x2, W1_edge)
+    
+    if MOV_ACT_TYPE == 0:
+        X1 = swish(Y1, MOV_BETA) 
+        X2 = swish(Y2, MOV_BETA)
+    else:
+        X1 = Y1 * tl.sigmoid(Y1)
+        X2 = Y2 * tl.sigmoid(Y2)
     
     seq_1 = tl.arange(0, 1)
     w2_addr = w2_mov_ptr + (horizontal_sequence[:, None] * 1) + seq_1[None, :]
     
     W2_edge = tl.load(w2_addr, other=0.0)
     
-    return tl.dot(Y1, W2_edge), tl.dot(Y2, W2_edge)
+    return tl.dot(X1, W2_edge), tl.dot(X2, W2_edge)
     
 @triton.jit
 def swish(Y, BETA: tl.constexpr):
-    return Y/(1 + tl.exp(-BETA * Y))
+    return Y * tl.sigmoid(BETA * Y)
