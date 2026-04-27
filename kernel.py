@@ -84,6 +84,7 @@ def mpnn_forward(
     n1_coord = tl.load(n1_coord_addr, mask=coord_mask, other=0.0)
     n2_coord = tl.load(n2_coord_addr, mask=coord_mask,  other=0.0)
     
+    """
     # 4. RBF distances calculation
     rbf_seq = tl.arange(0, RBF_DIM)
     centers = tl.load(rbf_centers_ptr + rbf_seq)
@@ -94,6 +95,10 @@ def mpnn_forward(
     x = tl.sqrt(x)
     centered_x = x[:, None] - centers[None, :]
     distances = tl.exp(-rbf_gamma * (centered_x * centered_x))
+    """
+    x_inc = n1_coord - n2_coord
+    sq_dist = tl.sum(x_inc * x_inc, axis=1)
+    distances = sq_dist[:, None]
     
     # 5. MLP partial message obtention
     Y1, Y2 = message_mlp(F_NODE, F_EDGE, OUT_FEATURES, HIDDEN_FEATURES, RBF_DIM, 
