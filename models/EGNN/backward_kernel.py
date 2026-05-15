@@ -1,6 +1,15 @@
 import triton
 import triton.language as tl
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_SIZE_NEIGHBORS': 16}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_NEIGHBORS': 32}, num_warps=4, num_stages=1),
+        triton.Config({'BLOCK_SIZE_NEIGHBORS': 32}, num_warps=8, num_stages=1),
+        triton.Config({'BLOCK_SIZE_NEIGHBORS': 64}, num_warps=8, num_stages=1),
+    ],
+    key=['num_nodes', 'F_NODE', 'HIDDEN_FEATURES']
+)
 @triton.jit
 def egnn_backward_kernel_node_parallel(
     # --- Pointers: Forward Inputs ---
