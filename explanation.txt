@@ -85,28 +85,91 @@ The code repeats the process for the movement MLP. The input of this MLP is the 
 # Section 1.8: Backward Variables & Accumulators
 # =======================================================
 
-Now it's turn of the univariant backward variables. In this case, the code not only loads variables, but it also reserves memory for posterior storing.
-Training an EGNN layer requires all the variables from end-to-end, which means that we need the input also. This input is the output of the previous layer, which means these are correctable values, which means that we require a gradient to chain the loss. This input and its gradients aren't computed by the current layer, so the code loads them.
-All the rest of the values are computed by this layer, so instead of loading them, the code initializes them.
-The input of the layer is: the two node features, the distance and the edge features. The node features are the ouput of the node MLPs from the main node MLP and the neighbor node MLP. 
-When doing the training, Pytorch ensures that the kernels are executed in a determined order, which means that all the node process will be syncronized refering the layer. This is crucial because the gradient of another layer is an addition of all the corrections of all the neighbors. So the kernel confidently loads the gradients of the neighbors and main node, relying on this syncronization. 
-For the coordinates, the movement MLP computed the force of the update, but the input are the coordinates, which means that the gradient will be translated. In other words, the input gradient refers to how to modify
+Now it's turn of the univariant backward variables. The layer needs the incoming gradient from the next layer, which means that when doing the training, there must be some type of syncroinization so all the layers are done sequentally. This is handled by PyTorch but it is important to clarify.
+Now refering to the incoming gradient, there is two types: the node gradient and the coordinates gradient.
+One of the ouputs of the layer is the output of the node MLP. The incoming gradient comes from part of the gradient of the message MLP.
+The other ouput of the layer is the updated coordinates. The loss of the coordinates is obtained with the formula L = (delta_x)^2 + (delta_y)^2 + (delta_z)^2.
+The rest of the gradients are calculated by the layer.
 
 # =======================================================
-
+# Section 2. Neighbor range from CSR
 # =======================================================
 
+Now it's turn for one of the biggest optimizations this code provides.
+When scaling the angstroms, the number of neighbors grows cubically, and so does the related tensors. This usually results in an OOM.
+The way this code deals with this is by using blocking. Instead of computing the whole neighbor tensors, the code iterates over ranges, loading one block per iteration. This means that globally the memory cost is the same, but at any given time it ends up being lower.
+
+This EGNN implementation uses CSR as its adjacency format. CSR stores two arrays: one with the neighbor indices of all nodes concatenated, and one with the starting position of each node's neighbors in that list. By loading row_ptrs[i] and row_ptrs[i+1], the kernel knows exactly where to start and stop iterating without scanning the whole edge list.
+Instead of having one row_ptrs and consult it two times, we have two copies but one is advanced in with position, this way the indices are aligned and matricial operations become possible.
 
 # =======================================================
-
+# Section 3. Neighbor node indices, features, coords
 # =======================================================
 
+Inside the loop, the first task is to figure out which neighbors belong to the current block and load their properties. This follows the same four-step pattern described in Section 1 (sequence, address, mask, load), but now applied to a block of neighbors simultaneously rather than a single node.
+
+The key difference here is that the addresses are no longer a simple offset from a base pointer. The neighbors are not necessarily contiguous in memory (node 5's neighbors could be nodes 0, 12, and 47). So the kernel first loads the neighbor indices themselves from col_indices_ptr, and then uses those indices to prepare the actual memory addresses of their features and coordinates.
+
+The same applies to edge features. The edge index stored in edge_id_ptr is needed because the edge features are indexed by the original edge ordering, which may differ from the CSR ordering. Without this indirection, the kernel would load the wrong edge features.
+
+The neighbors_mask is the blocking mask. Any position in the block that goes beyond neighbors_end is padding and should be ignored in all subsequent computations of this iteration.
 
 # =======================================================
-
+# Section 4. Forward Geometry
 # =======================================================
 
+This section computes the two geometric quantities that the message MLP needs: the displacement vector delta and the squared distance sq_dist.
+
+delta is simply the vector pointing from each neighbor to the main node. The subtraction is done in 2D because main_coords_2d was already broadcasted to BLOCK_SIZE_NEIGHBORS rows in Section 1, so each row of neighbors_coo is subtracted from the same main node coordinates simultaneously.
+
+sq_dist is then the squared norm of each delta vector, obtained by squaring element-wise and summing along the coordinate axis. Note that the fourth padded column contributes zero to this sum because it was loaded with other=0.0.
+
+The reason squared distance is used instead of plain distance is to avoid a square root operation, which is expensive and introduces numerical instability in gradients. The message MLP learns to work with squared distances directly.
 
 # =======================================================
+# Section 5. Message & Movement MLP Forward Rematerialization
+# =======================================================
+
+This section recomputes the forward pass of both MLPs. The key word here is rematerialization — this computation was already done during the forward pass, so why is it being done again?
+
+The answer is VRAM. A naive backward pass would store all intermediate activations during the forward pass and reuse them here. For large graphs this becomes the dominant memory cost, which is exactly what this project is trying to avoid.
+
+Instead, the kernel discards those activations after the forward pass and recomputes them on the fly during the backward pass. The cost is extra computation, but computation is cheap compared to VRAM. This is a classic memory-compute tradeoff and in this context it is clearly worth it.
+
+The functions message_mlp_forward_remat and movement_mlp_forward_remat return not just the final output but also the intermediate pre-activation and post-activation tensors, because those are exactly what the backward pass needs to compute the activation function gradients in Section 6.
 
 # =======================================================
+# Section 6. The Backward Pass (Pure Math)
+# =======================================================
+
+This is the core of the kernel. Given the rematerialized activations and the incoming gradients, this section propagates the loss signal backwards through every operation in the forward pass. The chain rule is applied repeatedly, working backwards from outputs to inputs.
+
+There are two independent paths through which the loss reaches the coordinates. Path A comes from the movement MLP through grad_x_i, and Path B comes from the message MLP through the squared distance. Both paths produce a gradient with respect to delta, and since delta = main_coords - neighbor_coords, these gradients are summed at the confluence before being split into the main node coordinate gradient and the neighbor coordinate gradient (which has opposite sign, reflecting that moving the main node right is equivalent to moving the neighbor left).
+
+The same confluence happens for features. The message MLP gradient flows back to both the main node features and the neighbor features through their respective weight matrices.
+
+The activation function gradients follow the standard swish derivative formula, with the BETA scaling applied when ACT_TYPE == 0.
+
+# =======================================================
+# Section 7. Atomic Writes for Neighbors
+# =======================================================
+
+The neighbor gradients cannot be written with a plain store. Multiple kernel instances may be processing different main nodes that share the same neighbor, meaning they will all try to write to the same memory location simultaneously. Without coordination this would produce corrupted values.
+
+atomic_add solves this by guaranteeing that concurrent writes are serialized at the hardware level. Each kernel's contribution is added to the accumulator in memory one at a time, so the final value correctly reflects the sum of all contributions from all edges that node participated in.
+
+This is the main synchronization cost of the node-parallel approach. The more edges a node has, the more kernels will be competing to atomically write to its gradient. However as argued in Section 1, this is still preferable to the edge-parallel approach where every single edge produces two atomic writes, one per node.
+
+Note that the main node gradients are not written here — they live in accumulators that are still being updated in each loop iteration. They are only written once the loop is complete, in Section 8.
+
+# =======================================================
+# Section 8. Post-Loop Main Node & Weight Evacuation
+# =======================================================
+
+Once the neighbor loop is finished, the accumulators contain the complete gradients for the main node and for all the weights. These are now written out to memory.
+
+The main node feature and coordinate gradients are written with a plain tl.store. This is safe because each kernel instance owns exactly one main node and no other kernel will write to the same location. The coordinate store reuses coord_mask for the same reason as in Section 1 — the fourth padded column must not be written.
+
+The weight gradients however require atomic_add. The weights are shared across the entire graph, meaning every kernel instance has computed a partial gradient contribution to the same weight tensors. These must be accumulated atomically in the same way as the neighbor gradients in Section 7.
+
+This is also why the weight gradients were kept as register accumulators throughout the loop rather than atomically added each iteration — doing one atomic write per weight tensor per kernel is far cheaper than doing one atomic write per weight tensor per neighbor block per kernel.
